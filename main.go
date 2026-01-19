@@ -79,7 +79,18 @@ func run() error {
 			if err := ensureConfigExists(); err != nil {
 				return err
 			}
-			output, err := executePrompt(strings.Join(args, " "))
+			prompt := strings.Join(args, " ")
+
+			// If there's piped input, append it to the prompt
+			if isPiped() {
+				input, err := io.ReadAll(os.Stdin)
+				if err != nil {
+					return fmt.Errorf("failed to read piped input: %w", err)
+				}
+				prompt = prompt + "\n\n" + strings.TrimSpace(string(input))
+			}
+
+			output, err := executePrompt(prompt)
 			if err != nil {
 				return err
 			}
