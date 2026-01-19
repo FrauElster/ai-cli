@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,8 +14,35 @@ import (
 	"strings"
 )
 
+type Provider string
+
+const (
+	OpenAI = "openai"
+	Ollama = "ollama"
+)
+
 type Config struct {
-	Model string `json:"model"`
+	Model    string   `json:"model"`
+	Provider Provider `json:"provider"` // "ollama" or "openai"
+}
+
+type OpenAIRequest struct {
+	Model    string          `json:"model"`
+	Messages []OpenAIMessage `json:"messages"`
+}
+
+type OpenAIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIResponse struct {
+	Choices []struct {
+		Message OpenAIMessage `json:"message"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 const configFileName = ".config/ai-cli.json"
@@ -26,10 +55,6 @@ func main() {
 }
 
 func run() error {
-	if !isOllamaInstalled() {
-		return fmt.Errorf("ollama is not installed or not in PATH. Please install ollama first")
-	}
-
 	var outputFile string
 	args := os.Args[1:]
 
@@ -39,7 +64,6 @@ func run() error {
 				return fmt.Errorf("-o flag requires a filename argument")
 			}
 			outputFile = args[i+1]
-			// Remove -o and its argument from args
 			args = append(args[:i], args[i+2:]...)
 			break
 		}
@@ -110,6 +134,10 @@ func isOllamaInstalled() bool {
 	return err == nil
 }
 
+func hasOpenAIToken() bool {
+	return os.Getenv("OPENAI_API_KEY") != ""
+}
+
 func isPiped() bool {
 	stat, _ := os.Stdin.Stat()
 	return (stat.Mode() & os.ModeCharDevice) == 0
@@ -160,7 +188,6 @@ func getInstalledModels() ([]string, error) {
 	lines := strings.Split(string(output), "\n")
 	var models []string
 
-	// Skip header line and parse model names
 	for i, line := range lines {
 		if i == 0 || strings.TrimSpace(line) == "" {
 			continue
@@ -174,47 +201,90 @@ func getInstalledModels() ([]string, error) {
 	return models, nil
 }
 
+func getOpenAIModels() []string {
+	return []string{
+		"gpt-5-nano",
+		"gpt-5-mini",
+		"gpt-5.2",
+	}
+}
+
+func getAllAvailableModels() (map[string][]string, error) {
+	available := make(map[string][]string)
+
+	if isOllamaInstalled() {
+		ollamaModels, err := getInstalledModels()
+		if err == nil && len(ollamaModels) > 0 {
+			available["ollama"] = ollamaModels
+		}
+	}
+
+	if hasOpenAIToken() {
+		available["openai"] = getOpenAIModels()
+	}
+
+	return available, nil
+}
+
 func initCommand() error {
-	models, err := getInstalledModels()
+	available, err := getAllAvailableModels()
 	if err != nil {
 		return err
 	}
 
-	var selectedModel string
-
-	if len(models) == 0 {
-		fmt.Println("No models installed.")
-		fmt.Println("Please install a model first, for example:")
-		fmt.Println("  ollama pull llama3.2")
+	if len(available) == 0 {
+		fmt.Println("No models available.")
+		fmt.Println("Please either:")
+		fmt.Println("  1. Install ollama and pull a model (e.g., 'ollama pull llama3.2')")
+		fmt.Println("  2. Set OPENAI_API_KEY environment variable")
 		return nil
-	} else if len(models) == 1 {
-		selectedModel = models[0]
-		fmt.Printf("Using the only installed model: %s\n", selectedModel)
-	} else {
-		fmt.Println("Multiple models installed:")
-		for i, model := range models {
-			fmt.Printf("%d. %s\n", i+1, model)
-		}
-		fmt.Printf("Select a model (1-%d) [1]: ", len(models))
-
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "" {
-			selectedModel = models[0]
-		} else {
-			var choice int
-			fmt.Sscanf(input, "%d", &choice)
-			if choice < 1 || choice > len(models) {
-				return fmt.Errorf("invalid choice")
-			}
-			selectedModel = models[choice-1]
-		}
-		fmt.Printf("Selected model: %s\n", selectedModel)
 	}
 
-	config := &Config{Model: selectedModel}
+	// Build a flat list of models with their providers
+	type ModelOption struct {
+		Provider Provider
+		Model    string
+	}
+	var options []ModelOption
+
+	if models, ok := available["ollama"]; ok {
+		for _, model := range models {
+			options = append(options, ModelOption{Provider: Ollama, Model: model})
+		}
+	}
+	if models, ok := available["openai"]; ok {
+		for _, model := range models {
+			options = append(options, ModelOption{Provider: OpenAI, Model: model})
+		}
+	}
+
+	fmt.Println("Available models:")
+	for i, opt := range options {
+		fmt.Printf("%d. [%s] %s\n", i+1, opt.Provider, opt.Model)
+	}
+	fmt.Printf("Select a model (1-%d) [1]: ", len(options))
+
+	reader := bufio.NewReader(os.Stdin)
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	var choice int
+	if input == "" {
+		choice = 1
+	} else {
+		fmt.Sscanf(input, "%d", &choice)
+		if choice < 1 || choice > len(options) {
+			return fmt.Errorf("invalid choice")
+		}
+	}
+
+	selected := options[choice-1]
+	fmt.Printf("Selected: [%s] %s\n", selected.Provider, selected.Model)
+
+	config := &Config{
+		Model:    selected.Model,
+		Provider: selected.Provider,
+	}
 	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
@@ -224,20 +294,37 @@ func initCommand() error {
 }
 
 func setModelCommand() error {
-	models, err := getInstalledModels()
+	available, err := getAllAvailableModels()
 	if err != nil {
 		return err
 	}
 
-	if len(models) == 0 {
-		return fmt.Errorf("no models installed")
+	if len(available) == 0 {
+		return fmt.Errorf("no models available")
+	}
+
+	type ModelOption struct {
+		Provider Provider
+		Model    string
+	}
+	var options []ModelOption
+
+	if models, ok := available["ollama"]; ok {
+		for _, model := range models {
+			options = append(options, ModelOption{Provider: Ollama, Model: model})
+		}
+	}
+	if models, ok := available["openai"]; ok {
+		for _, model := range models {
+			options = append(options, ModelOption{Provider: OpenAI, Model: model})
+		}
 	}
 
 	fmt.Println("Available models:")
-	for i, model := range models {
-		fmt.Printf("%d. %s\n", i+1, model)
+	for i, opt := range options {
+		fmt.Printf("%d. [%s] %s\n", i+1, opt.Provider, opt.Model)
 	}
-	fmt.Printf("Select a model (1-%d): ", len(models))
+	fmt.Printf("Select a model (1-%d): ", len(options))
 
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
@@ -245,17 +332,20 @@ func setModelCommand() error {
 
 	var choice int
 	fmt.Sscanf(input, "%d", &choice)
-	if choice < 1 || choice > len(models) {
+	if choice < 1 || choice > len(options) {
 		return fmt.Errorf("invalid choice")
 	}
 
-	selectedModel := models[choice-1]
-	config := &Config{Model: selectedModel}
+	selected := options[choice-1]
+	config := &Config{
+		Model:    selected.Model,
+		Provider: selected.Provider,
+	}
 	if err := saveConfig(config); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	fmt.Printf("Model changed to: %s\n", selectedModel)
+	fmt.Printf("Model changed to: [%s] %s", selected.Provider, selected.Model)
 	return nil
 }
 
@@ -263,10 +353,10 @@ func printHelp() error {
 	config, err := loadConfig()
 	currentModel := "not configured"
 	if err == nil {
-		currentModel = config.Model
+		currentModel = fmt.Sprintf("[%s] %s", config.Provider, config.Model)
 	}
 
-	fmt.Printf(`AI CLI - Ollama Command Line Interface
+	fmt.Printf(`AI CLI - Ollama & OpenAI Command Line Interface
 
 Current model: %s
 
@@ -283,6 +373,9 @@ Examples:
   ai-cli "What is the capital of France?"
   ai-cli -o answer.txt "Explain quantum computing"
   echo "Explain quantum computing" | ai-cli -o output.txt
+
+Environment Variables:
+  OPENAI_API_KEY                OpenAI API key (enables OpenAI models)
 
 Note: Configuration is created automatically on first run.
 `, currentModel)
@@ -320,16 +413,26 @@ func executePrompt(prompt string) (string, error) {
 		return "", err
 	}
 
-	// check if model is still installed
-	installed, err := isModelInstalled(config.Model)
+	switch config.Provider {
+	case "ollama":
+		return executeOllama(config.Model, prompt)
+	case "openai":
+		return executeOpenAI(config.Model, prompt)
+	default:
+		return "", fmt.Errorf("unknown provider: %s", config.Provider)
+	}
+}
+
+func executeOllama(model, prompt string) (string, error) {
+	installed, err := isModelInstalled(model)
 	if err != nil {
 		return "", err
 	}
 	if !installed {
-		return "", fmt.Errorf("configured model '%s' is not installed. Please run 'init' or 'set-model'", config.Model)
+		return "", fmt.Errorf("configured model '%s' is not installed. Please run 'set-model'", model)
 	}
 
-	cmd := exec.Command("ollama", "run", config.Model, prompt)
+	cmd := exec.Command("ollama", "run", model, prompt)
 	cmd.Stderr = os.Stderr
 
 	output, err := cmd.Output()
@@ -338,4 +441,58 @@ func executePrompt(prompt string) (string, error) {
 	}
 
 	return string(output), nil
+}
+
+func executeOpenAI(model, prompt string) (string, error) {
+	apiKey := os.Getenv("OPENAI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("OPENAI_API_KEY environment variable not set")
+	}
+
+	reqBody := OpenAIRequest{
+		Model: model,
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: prompt},
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var openAIResp OpenAIResponse
+	if err := json.Unmarshal(body, &openAIResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if openAIResp.Error != nil {
+		return "", fmt.Errorf("OpenAI API error: %s", openAIResp.Error.Message)
+	}
+
+	if len(openAIResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from OpenAI")
+	}
+
+	return openAIResp.Choices[0].Message.Content, nil
 }
